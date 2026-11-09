@@ -1,549 +1,799 @@
 ###############################################################################
-#  Infection tuberculeuse latente (ITL) chez le personnel de santé
-#  Analyse statistique complète – résultat QuantiFERON (QFT)
+#  Latent tuberculosis infection (LTBI) among healthcare workers
+#  Complete statistical analysis of QuantiFERON (QFT) data – from A to Z
 #
-#  Questions de recherche
-#   Q1. Quelle est la prévalence de l'ITL (QFT+) dans cette population ?
-#   Q2. Quels facteurs sont associés à un QFT+ en analyse bivariée ?
-#   Q3. Quels facteurs restent associés après ajustement (régression logistique
-#       multivariable), et le modèle est-il fiable ?
+#  Research questions
+#   Q1. What is the prevalence of LTBI (QFT positive) in this population?
+#   Q2. Which factors are associated with QFT positivity (bivariate analysis)?
+#   Q3. Which factors remain associated after adjustment (multivariable
+#       logistic regression), and how reliable is the model?
 #
+#  Methods: a priori variable
+#  selection, events per parameter, multiple imputation, Firth regression,
+#  bootstrap internal validation.
+
 ###############################################################################
 
-## 0. Packages et paramètres ---------------------------------------------------
-pkgs <- c("readxl", "dplyr", "tidyr", "stringr", "forcats", "ggplot2",
-          "broom", "car", "pROC", "rms", "brglm2", "mice", "openxlsx")
-manquants <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
-if (length(manquants) > 0) install.packages(manquants)
+
+## 0. SETUP ====================================================================
+pkgs <- c("readxl", "dplyr", "tidyr", "stringr", "forcats", "ggplot2", "patchwork",
+          "broom", "car", "pROC", "rms", "brglm2", "mice", "openxlsx",
+          "flextable", "officer")
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) install.packages(missing_pkgs)
 suppressPackageStartupMessages(invisible(lapply(pkgs, library, character.only = TRUE)))
 
+data_file <- "Data_QFT_Youssra.xlsx"   # adapt the path if needed
+out_dir   <- "results"
+fig_dir   <- file.path(out_dir, "figures")
+supp_dir  <- file.path(fig_dir, "supplementary")
+tab_dir   <- file.path(out_dir, "tables")
+for (p in c(out_dir, fig_dir, supp_dir, tab_dir)) dir.create(p, showWarnings = FALSE, recursive = TRUE)
 
-fichier  <- "Data_QFT_Youssra.xlsx"   # adapter le chemin si besoin
-dossier  <- "resultats"               # dossier de sortie (tableaux, figures)
-dir.create(dossier, showWarnings = FALSE)
-set.seed(2026)                        # reproductibilité (bootstrap, imputation)
+SEED <- 2026        # fixed seed: Monte Carlo p-values, bootstrap and imputation
 options(digits = 4)
 
-## 1. Import -------------------------------------------------------------------
-brut <- read_excel(fichier, na = c("", "NA"))   # "NA" saisi en texte = manquant
-names(brut) <- c("id", "age", "sexe", "profession", "service", "exposition",
-                 "experience", "masque", "formation", "bcg", "cicatrice",
-                 "tabac", "qft", "antecedents", "pratiques")
-table(brut$qft)
-cat("Observations importées :", nrow(brut), "\n")
+# Formatting helpers (2 decimals for OR, 3 for p-values)
+f1  <- function(x) formatC(x, format = "f", digits = 1)
+f2  <- function(x) formatC(x, format = "f", digits = 2)
+fp  <- function(p) ifelse(is.na(p), "", ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3)))
+fOR <- function(or, lo, hi) sprintf("%s (%s–%s)", f2(or), f2(lo), f2(hi))
+miss_txt <- function(m) if (m > 0) sprintf(" (%d missing)", m) else ""
 
-## 2. Nettoyage et recodage ----------------------------------------------------
 
-txt <- function(x) str_squish(as.character(x))
-oui_non <- function(x) {
-  x <- str_to_lower(txt(x))
-  case_when(x %in% c("yes", "oui", "rarement") ~ "Oui",   # "rarement" = exposé
-            x %in% c("no", "n", "non")         ~ "Non",
-            TRUE ~ NA_character_)                          # "RAS" = non interprétable
+## 1. IMPORT ===================================================================
+raw <- read_excel(data_file, na = c("", "NA"))     # "NA" typed as text = missing
+names(raw) <- c("id", "age", "sex", "occupation", "department", "tb_exposure",
+                "experience", "mask", "biosafety_training", "bcg", "bcg_scar",
+                "smoking", "qft_raw", "history", "practices")
+cat("Records imported:", nrow(raw), "\n")
+
+
+## 2. DATA CLEANING AND RECODING ===============================================
+# Every recoding decision is explicit here, so that it can be checked.
+sq <- function(x) str_squish(as.character(x))
+yes_no <- function(x) {
+  x <- str_to_lower(sq(x))
+  case_when(x %in% c("yes", "oui", "rarement") ~ "Yes",   # one answer "rarement" = exposed
+            x %in% c("no", "n", "non")         ~ "No",
+            TRUE ~ NA_character_)                          # e.g. "RAS" = not interpretable
 }
 
-d <- brut %>%
+d <- raw %>%
   mutate(
-    across(everything(), ~ if (is.character(.x)) txt(.x) else .x),
+    across(everything(), ~ if (is.character(.x)) sq(.x) else .x),
     age        = as.numeric(age),
     experience = suppressWarnings(as.numeric(experience)),
-    # Issue principale : QFT+ (1) / QFT- (0) ; indéterminé = manquant
-    qft_pos = case_when(qft == "QFT+" ~ 1L, qft == "QFT-" ~ 0L, TRUE ~ NA_integer_),
-    sexe = factor(sexe, levels = c("Female", "Male"), labels = c("Femme", "Homme")),
 
-    # Profession regroupée en catégories cliniquement homogènes
-    profession_g = case_when(
-      str_detect(profession, regex("doctor|médcin|docteur|intern", TRUE)) ~ "Médecin / interne",
-      str_detect(profession, regex("^nurse", TRUE))                       ~ "Infirmier",
-      str_detect(profession, regex("nursing assistant|ambulancier", TRUE)) ~ "Aide-soignant / ambulancier",
-      str_detect(profession, regex("laboratory|scientifique|technical|pharmacien", TRUE)) ~ "Laboratoire / pharmacie",
-      !is.na(profession) ~ "Personnel non soignant",
+    # Outcome: QFT positive (1) / negative (0); indeterminate = missing
+    qft_pos = case_when(qft_raw == "QFT+" ~ 1L, qft_raw == "QFT-" ~ 0L, TRUE ~ NA_integer_),
+    sex = factor(sex, levels = c("Female", "Male")),
+
+    # Occupation: 5 clinically homogeneous groups (reference = Nurse)
+    occupation_grp = case_when(
+      str_detect(occupation, regex("doctor|médcin|docteur|intern", TRUE))               ~ "Physician / intern",
+      str_detect(occupation, regex("^nurse", TRUE))                                     ~ "Nurse",
+      str_detect(occupation, regex("nursing assistant|ambulancier", TRUE))              ~ "Nursing assistant / EMT",
+      str_detect(occupation, regex("laboratory|scientifique|technical|pharmacien", TRUE)) ~ "Laboratory / pharmacy",
+      !is.na(occupation) ~ "Non-clinical staff",
       TRUE ~ NA_character_),
-    profession_g = factor(profession_g, levels = c("Infirmier", "Médecin / interne",
-                          "Aide-soignant / ambulancier", "Laboratoire / pharmacie",
-                          "Personnel non soignant")),
+    occupation_grp = factor(occupation_grp, levels = c("Nurse", "Physician / intern",
+      "Nursing assistant / EMT", "Laboratory / pharmacy", "Non-clinical staff")),
 
-    # Service regroupé
-    service_g = case_when(
-      str_detect(service, regex("intensive care", TRUE))               ~ "Réanimation",
-      str_detect(service, regex("pulmonology", TRUE))                  ~ "Pneumologie",
-      str_detect(service, regex("emergency|resuscitation", TRUE))      ~ "Urgences / SAMU",
-      str_detect(service, regex("laboratory|genetics", TRUE))          ~ "Laboratoire",
-      str_detect(service, regex("consultation|internal|ophthalmo", TRUE)) ~ "Médecine / consultations",
-      !is.na(service) ~ "Administration / sécurité",
+    # Department: 6 groups (reference = Intensive care)
+    department_grp = case_when(
+      str_detect(department, regex("intensive care", TRUE))                   ~ "Intensive care",
+      str_detect(department, regex("pulmonology", TRUE))                      ~ "Pulmonology",
+      str_detect(department, regex("emergency|resuscitation", TRUE))          ~ "Emergency / EMS",
+      str_detect(department, regex("laboratory|genetics", TRUE))              ~ "Laboratory",
+      str_detect(department, regex("consultation|internal|ophthalmo", TRUE))  ~ "Medicine / outpatient",
+      !is.na(department) ~ "Administration / security",
       TRUE ~ NA_character_),
-    service_g = factor(service_g, levels = c("Réanimation", "Pneumologie", "Urgences / SAMU",
-                       "Laboratoire", "Médecine / consultations", "Administration / sécurité")),
+    department_grp = factor(department_grp, levels = c("Intensive care", "Pulmonology",
+      "Emergency / EMS", "Laboratory", "Medicine / outpatient", "Administration / security")),
 
-    exposition = factor(oui_non(exposition), levels = c("Non", "Oui")),
-    formation  = factor(oui_non(formation),  levels = c("Oui", "Non")),
-    bcg        = factor(oui_non(bcg),        levels = c("Oui", "Non")),
-    cicatrice  = factor(oui_non(cicatrice),  levels = c("Oui", "Non")),
+    tb_exposure        = factor(yes_no(tb_exposure),        levels = c("No", "Yes")),
+    biosafety_training = factor(yes_no(biosafety_training), levels = c("Yes", "No")),
+    bcg                = factor(yes_no(bcg),                levels = c("Yes", "No")),
+    bcg_scar           = factor(yes_no(bcg_scar),           levels = c("Yes", "No"),
+                                labels = c("Present", "Absent")),
 
-    # Port du masque : variable ordinale ; "NeveRarely" = Rarement ; "P" = manquant
-    masque = case_when(masque %in% c("Never")                 ~ "Jamais / rarement",
-                       masque %in% c("Rarely", "NeveRarely")  ~ "Jamais / rarement",
-                       masque == "Sometimes" ~ "Parfois",
-                       masque == "Often"     ~ "Souvent",
-                       masque == "Always"    ~ "Toujours",
-                       TRUE ~ NA_character_),
-    masque = factor(masque, levels = c("Toujours", "Souvent", "Parfois", "Jamais / rarement")),
-    masque_reg = factor(ifelse(is.na(masque), NA,
-                        ifelse(masque %in% c("Toujours", "Souvent"), "Régulier", "Irrégulier")),
-                        levels = c("Régulier", "Irrégulier")),
+    # Mask use: ordinal; "NeveRarely" = rarely; "P" = missing; never + rarely merged
+    mask4 = case_when(mask %in% c("Never", "Rarely", "NeveRarely") ~ "Never / rarely",
+                      mask == "Sometimes" ~ "Sometimes",
+                      mask == "Often"     ~ "Often",
+                      mask == "Always"    ~ "Always",
+                      TRUE ~ NA_character_),
+    mask4 = factor(mask4, levels = c("Always", "Often", "Sometimes", "Never / rarely")),
+    mask_regular = factor(ifelse(is.na(mask4), NA,
+                          ifelse(mask4 %in% c("Always", "Often"), "Regular", "Irregular")),
+                          levels = c("Regular", "Irregular")),
 
-    # Tabac : fumeur actuel ou ancien = "Oui"
-    tabac = case_when(str_to_lower(tabac) == "no" ~ "Non",
-                      is.na(tabac) ~ NA_character_,
-                      TRUE ~ "Oui"),
-    tabac = factor(tabac, levels = c("Non", "Oui")),
+    # Smoking: current or former smoker = "Yes"
+    smoking = case_when(str_to_lower(smoking) == "no" ~ "No",
+                        is.na(smoking) ~ NA_character_,
+                        TRUE ~ "Yes"),
+    smoking = factor(smoking, levels = c("No", "Yes")),
 
-    # Antécédents (champ libre ; vide = aucun antécédent déclaré)
-    antecedents = ifelse(is.na(antecedents) | str_to_upper(antecedents) == "NA", "", antecedents),
-    atcd_tb    = factor(ifelse(str_detect(antecedents, regex("tubercul", TRUE)), "Oui", "Non"), c("Non", "Oui")),
-    atcd_covid = factor(ifelse(str_detect(antecedents, regex("covid", TRUE)), "Oui", "Non"), c("Non", "Oui")),
+    # Medical history (free text; blank = none reported)
+    history = ifelse(is.na(history) | str_to_upper(history) == "NA", "", history),
+    tb_history    = factor(ifelse(str_detect(history, regex("tubercul", TRUE)), "Yes", "No"), c("No", "Yes")),
+    covid_history = factor(ifelse(str_detect(history, regex("covid", TRUE)), "Yes", "No"), c("No", "Yes")),
 
-    # Pratiques à risque (champ libre ; vide = aucune pratique déclarée)
-    pratiques = ifelse(is.na(pratiques), "", pratiques),
-    pgae = factor(ifelse(str_detect(pratiques,
-                  regex("intubation|suction|aspiration|bronchoscop|sputum|expector|exprector|r[ée]animation", TRUE)),
-                  "Oui", "Non"), c("Non", "Oui")),   # procédures générant des aérosols
-    prelevements = factor(ifelse(str_detect(pratiques, regex("sample|sampling|prél", TRUE)), "Oui", "Non"), c("Non", "Oui")),
+    # High-risk practices (free text; blank = none reported)
+    practices = ifelse(is.na(practices), "", practices),
+    agp = factor(ifelse(str_detect(practices,
+            regex("intubation|suction|aspiration|bronchoscop|sputum|expector|exprector|r[ée]animation", TRUE)),
+            "Yes", "No"), c("No", "Yes")),                     # aerosol-generating procedures
+    specimen = factor(ifelse(str_detect(practices, regex("sample|sampling|prél", TRUE)), "Yes", "No"), c("No", "Yes")),
 
-    # Groupes d'âge et d'ancienneté (pour la description uniquement)
-    age_cl = cut(age, c(-Inf, 24, 29, Inf), labels = c("< 25 ans", "25–29 ans", "≥ 30 ans")),
-    exp_cl = cut(experience, c(-Inf, 1, 4, Inf), labels = c("≤ 1 an", "> 1 à 4 ans", "> 4 ans"))
+    # Age and experience groups (description only)
+    age_group = cut(age, c(-Inf, 24, 29, Inf), labels = c("< 25 years", "25–29 years", "≥ 30 years")),
+    exp_group = cut(experience, c(-Inf, 1, 4, Inf), labels = c("≤ 1 year", "> 1 to 4 years", "> 4 years"))
   )
 
 
-## 3. Contrôle de qualité --------------------------------------------------------
-cat("\nDoublons d'identifiant :", sum(duplicated(d$id)), "\n")
-cat("QFT indéterminé (exclu) :", sum(is.na(d$qft_pos)), "\n")
-# Cohérence entre le préfixe de l'identifiant (ITL = cas, TS = témoin sain) et le QFT
-d$prefixe <- str_extract(d$id, "(?<=-)[A-Z]+")
-print(table(Prefixe = d$prefixe, QFT = d$qft, useNA = "ifany"))
-print(d %>% filter((prefixe %in% c("ITL", "ILT") & qft != "QFT+") |
-                   (prefixe == "TS" & qft != "QFT-")) %>% select(id, qft))
-# Valeurs plausibles
+## 3. DATA QUALITY CHECKS ======================================================
+cat("\nDuplicate identifiers:", sum(duplicated(d$id)), "\n")
+cat("Indeterminate QFT results (excluded):", sum(is.na(d$qft_pos)), "\n")
+d$prefix <- str_extract(d$id, "(?<=-)[A-Z]+")          # ITL = LTBI case, TS = healthy control
+print(table(Prefix = d$prefix, QFT = d$qft_raw, useNA = "ifany"))
+print(d %>% filter((prefix %in% c("ITL", "ILT") & qft_raw != "QFT+") |
+                   (prefix == "TS" & qft_raw != "QFT-")) %>% select(id, qft_raw))
 print(summary(d[, c("age", "experience")]))
-cat("Ancienneté > âge - 16 ans :", sum(d$experience > d$age - 16, na.rm = TRUE), "\n")
+cat("Experience > age - 16 years:", sum(d$experience > d$age - 16, na.rm = TRUE), "\n")
 
-# Population d'analyse : QFT interprétable
-a <- d %>% filter(!is.na(qft_pos)) %>%
-  mutate(QFT = factor(qft_pos, 0:1, c("QFT-", "QFT+")))
-cat("Population d'analyse : n =", nrow(a), "\n")
+# Analysis population: interpretable QFT result
+a <- d %>% filter(!is.na(qft_pos)) %>% mutate(QFT = factor(qft_pos, 0:1, c("QFT-", "QFT+")))
+n_tot <- nrow(a); n_pos <- sum(a$qft_pos); n_neg <- n_tot - n_pos
+cat("Analysis population: n =", n_tot, "(QFT+ =", n_pos, ")\n")
 
-vars_cat <- c("sexe", "age_cl", "profession_g", "service_g", "exposition", "exp_cl",
-              "masque", "masque_reg", "formation", "bcg", "cicatrice", "tabac",
-              "atcd_tb", "atcd_covid", "pgae", "prelevements")
-vars_num <- c("age", "experience")
-libelles <- c(sexe = "Sexe", age_cl = "Classe d'âge", profession_g = "Profession",
-  service_g = "Service", exposition = "Exposition déclarée à la tuberculose",
-  exp_cl = "Ancienneté professionnelle", masque = "Port du masque",
-  masque_reg = "Port du masque (2 classes)", formation = "Formation en biosécurité",
-  bcg = "Vaccination BCG", cicatrice = "Cicatrice BCG", tabac = "Tabagisme (actuel ou ancien)",
-  atcd_tb = "Antécédent de tuberculose", atcd_covid = "Antécédent de COVID-19",
-  pgae = "Procédures générant des aérosols", prelevements = "Manipulation de prélèvements",
-  age = "Âge (ans)", experience = "Ancienneté (ans)")
+labels_en <- c(age = "Age (years)", experience = "Professional experience (years)",
+  sex = "Sex", age_group = "Age group", occupation_grp = "Occupation", department_grp = "Department",
+  tb_exposure = "Self-reported TB exposure", exp_group = "Professional experience",
+  mask4 = "Mask use", mask_regular = "Regular mask use", biosafety_training = "Biosafety training",
+  bcg = "BCG vaccination", bcg_scar = "BCG scar", smoking = "Current or former smoker",
+  tb_history = "History of tuberculosis", covid_history = "History of COVID-19",
+  agp = "Aerosol-generating procedures", specimen = "Specimen handling")
 
-# Données manquantes par variable
-manq <- data.frame(Variable = unname(libelles[c(vars_num, vars_cat)]),
-                   n_manquant = sapply(a[c(vars_num, vars_cat)], function(x) sum(is.na(x)))) %>%
-  mutate(pourcentage = round(100 * n_manquant / nrow(a), 1))
-print(manq, row.names = FALSE)
+# Supplementary Table S1 – missing data by variable
+vars_missing <- c("bcg_scar", "biosafety_training", "mask4", "experience", "bcg", "tb_exposure",
+                  "smoking", "occupation_grp", "department_grp", "age", "sex")
+table_S1 <- data.frame(Variable = unname(labels_en[vars_missing]),
+                       `Missing, n` = sapply(a[vars_missing], function(x) sum(is.na(x))),
+                       check.names = FALSE) %>%
+  mutate(`Missing, %` = f1(100 * `Missing, n` / n_tot))
+rownames(table_S1) <- NULL
+print(table_S1)
 
-## 4. Q1 – Prévalence de l'ITL ---------------------------------------------------
-n_pos <- sum(a$qft_pos); n_tot <- nrow(a)
-wilson <- prop.test(n_pos, n_tot, correct = FALSE)$conf.int
-exact  <- binom.test(n_pos, n_tot)$conf.int
-prevalence <- data.frame(
-  n_positifs = n_pos, n_total = n_tot, prevalence_pct = round(100 * n_pos / n_tot, 1),
-  IC95_Wilson = sprintf("%.1f–%.1f", 100 * wilson[1], 100 * wilson[2]),
-  IC95_exact  = sprintf("%.1f–%.1f", 100 * exact[1], 100 * exact[2]))
-print(prevalence)
 
-## 5. Description et analyse bivariée (Q2) ------------------------------------------
-# Variables quantitatives : normalité (Shapiro-Wilk) puis test adapté
-desc_num <- lapply(vars_num, function(v) {
-  x <- a[[v]]; g <- a$QFT
-  sw <- by(x, g, function(z) shapiro.test(z[!is.na(z)])$p.value)
-  normal <- all(unlist(sw) > 0.05)
-  test <- if (normal) t.test(x ~ g) else wilcox.test(x ~ g, exact = FALSE)
-  med <- function(z) sprintf("%.1f [%.1f–%.1f]", median(z, na.rm = TRUE),
-                             quantile(z, .25, na.rm = TRUE), quantile(z, .75, na.rm = TRUE))
-  data.frame(Variable = unname(libelles[v]),
-             Total = med(x), `QFT-` = med(x[g == "QFT-"]), `QFT+` = med(x[g == "QFT+"]),
-             Test = ifelse(normal, "t de Student", "Mann-Whitney"),
-             p = test$p.value, n_manquant = sum(is.na(x)), check.names = FALSE)
-}) %>% bind_rows()
+## 4. DESCRIPTIVE ANALYSIS – TABLE 2 ==========================================
+# Normality of continuous variables
+for (v in c("age", "experience")) {
+  x <- a[[v]][!is.na(a[[v]])]
+  cat(sprintf("%s: mean %.1f, median %.1f, skewness %.2f, Shapiro-Wilk p = %.4f\n", v, mean(x),
+              median(x), mean((x - mean(x))^3) / sd(x)^3, shapiro.test(x)$p.value))
+}
 
-# Variables qualitatives : chi² si tous les effectifs attendus ≥ 5, sinon Fisher
-desc_cat <- lapply(vars_cat, function(v) {
-  tab <- table(a[[v]], a$QFT)
-  attendu <- suppressWarnings(chisq.test(tab)$expected)
-  use_fisher <- any(attendu < 5)
-  p <- if (use_fisher) fisher.test(tab, simulate.p.value = nrow(tab) > 2, B = 1e5)$p.value
-       else chisq.test(tab, correct = FALSE)$p.value
-  tot <- rowSums(tab)
-  data.frame(Variable = unname(libelles[v]), Modalite = rownames(tab),
-             Total = sprintf("%d (%.1f)", tot, 100 * tot / sum(tot)),
-             `QFT-` = sprintf("%d (%.1f)", tab[, 1], 100 * tab[, 1] / sum(tab[, 1])),
-             `QFT+` = sprintf("%d (%.1f)", tab[, 2], 100 * tab[, 2] / sum(tab[, 2])),
-             `% QFT+ dans la ligne` = sprintf("%.1f", 100 * tab[, 2] / tot),
-             Test = ifelse(use_fisher, "Fisher exact", "Chi²"),
-             p = c(p, rep(NA, nrow(tab) - 1)), n_manquant = c(sum(is.na(a[[v]])), rep(NA, nrow(tab) - 1)),
-             check.names = FALSE)
-}) %>% bind_rows()
+desc_cat <- function(var, label, levels = NULL, single = NULL) {
+  x <- a[[var]]; tab <- table(x); tot <- sum(tab); m <- sum(is.na(x))
+  if (!is.null(single)) {   # binary variable: one line for the category of interest
+    return(data.frame(Characteristic = paste0(label, miss_txt(m)),
+                      Value = sprintf("%d (%s)", tab[single], f1(100 * tab[single] / tot)), type = "row"))
+  }
+  if (is.null(levels)) levels <- names(tab)
+  rbind(data.frame(Characteristic = paste0(label, miss_txt(m)), Value = "", type = "variable"),
+        data.frame(Characteristic = paste0("    ", levels),
+                   Value = sprintf("%d (%s)", as.integer(tab[levels]), f1(100 * tab[levels] / tot)),
+                   type = "row"))
+}
+desc_num <- function(var, label, k = 0) {
+  x <- a[[var]]; m <- sum(is.na(x)); x <- x[!is.na(x)]
+  fk <- function(z) formatC(z, format = "f", digits = k)
+  data.frame(Characteristic = c(paste0(label, ", mean ± SD", miss_txt(m)),
+                                paste0(label, ", median [IQR] (range)")),
+             Value = c(sprintf("%s ± %s", f1(mean(x)), f1(sd(x))),
+                       sprintf("%s [%s–%s] (%s–%s)", fk(median(x)), fk(quantile(x, .25)),
+                               fk(quantile(x, .75)), fk(min(x)), fk(max(x)))),
+             type = "row")
+}
+section <- function(t) data.frame(Characteristic = t, Value = "", type = "section")
 
-# Tendance pour le port du masque (variable ordinale) : test de Cochran-Armitage
-tm <- table(a$masque, a$QFT)
-p_tendance_masque <- prop.trend.test(tm[, 2], rowSums(tm))$p.value
-cat("Test de tendance (port du masque) : p =", signif(p_tendance_masque, 3), "\n")
+table2 <- rbind(
+  section("Sociodemographic characteristics"),
+  desc_num("age", "Age (years)"),
+  desc_cat("age_group", "Age group"),
+  desc_cat("sex", "Sex"),
+  desc_cat("smoking", "Current or former smoker", single = "Yes"),
+  section("Occupational characteristics"),
+  desc_cat("occupation_grp", "Occupation"),
+  desc_cat("department_grp", "Department", levels = c("Intensive care", "Laboratory",
+           "Medicine / outpatient", "Emergency / EMS", "Pulmonology", "Administration / security")),
+  desc_num("experience", "Professional experience (years)", k = 1),
+  desc_cat("exp_group", "Professional experience, groups"),
+  section("Exposure and high-risk practices"),
+  desc_cat("tb_exposure", "Self-reported exposure to tuberculosis", single = "Yes"),
+  desc_cat("agp", "Aerosol-generating procedures", single = "Yes"),
+  desc_cat("specimen", "Specimen handling", single = "Yes"),
+  section("Preventive measures"),
+  desc_cat("mask4", "Mask use"),
+  desc_cat("biosafety_training", "Biosafety training", single = "Yes"),
+  desc_cat("bcg", "BCG vaccinated", single = "Yes"),
+  desc_cat("bcg_scar", "BCG scar present", single = "Present"),
+  section("Medical history"),
+  desc_cat("tb_history", "History of tuberculosis", single = "Yes"),
+  desc_cat("covid_history", "History of COVID-19", single = "Yes"),
+  section("QuantiFERON result"),
+  desc_cat("QFT", "QuantiFERON result", levels = c("QFT+", "QFT-"))
+)
+rownames(table2) <- NULL
 
-# OR bruts (régression logistique simple, IC par vraisemblance profilée)
-or_brut <- function(v) {
-  m <- glm(reformulate(v, "qft_pos"), data = a, family = binomial)
+
+## 5. Q1 – PREVALENCE OF LTBI ==================================================
+ci_wilson <- prop.test(n_pos, n_tot, correct = FALSE)$conf.int * 100
+ci_exact  <- binom.test(n_pos, n_tot)$conf.int * 100
+cat(sprintf("\nLTBI prevalence: %d/%d = %.1f%% (Wilson 95%% CI %.1f–%.1f; exact %.1f–%.1f)\n",
+            n_pos, n_tot, 100 * n_pos / n_tot, ci_wilson[1], ci_wilson[2], ci_exact[1], ci_exact[2]))
+cat(sprintf("Half-width of the Wilson CI: %.1f percentage points\n", diff(ci_wilson) / 2))
+
+wilson <- function(x, n) suppressWarnings(prop.test(x, n, correct = FALSE)$conf.int)
+prev_by <- function(var) a %>% filter(!is.na(.data[[var]])) %>% group_by(group = .data[[var]]) %>%
+  summarise(n = n(), positive = sum(qft_pos), .groups = "drop") %>% rowwise() %>%
+  mutate(prevalence = 100 * positive / n, ci_low = 100 * wilson(positive, n)[1],
+         ci_high = 100 * wilson(positive, n)[2]) %>% ungroup()
+prev_department <- prev_by("department_grp"); prev_occupation <- prev_by("occupation_grp")
+print(prev_department); print(prev_occupation)
+
+
+## 6. Q2 – BIVARIATE ANALYSIS – TABLE 3 =======================================
+# Tests: chi-square if all expected counts >= 5, otherwise Fisher's exact test
+# (Monte Carlo p-value for tables with > 2 rows); Mann-Whitney for continuous
+# variables. Crude OR: univariable logistic regression, profile-likelihood CI.
+crude_or <- function(var) {
+  m  <- glm(reformulate(var, "qft_pos"), data = a, family = binomial)
   ci <- suppressMessages(exp(confint(m)))
-  data.frame(Variable = unname(libelles[v]), Terme = names(coef(m))[-1],
-             OR = exp(coef(m))[-1], IC_bas = ci[-1, 1], IC_haut = ci[-1, 2],
-             p_Wald = summary(m)$coefficients[-1, 4],
-             p_global_LRT = c(drop1(m, test = "LRT")[2, "Pr(>Chi)"], rep(NA, length(coef(m)) - 2)),
-             n = nobs(m))
+  list(or = exp(coef(m))[-1], lo = ci[-1, 1], hi = ci[-1, 2])
 }
-vars_or <- c("age", "experience", "sexe", "profession_g", "service_g", "exposition",
-             "masque_reg", "formation", "bcg", "cicatrice", "tabac", "atcd_covid",
-             "pgae", "prelevements")
-tab_or_brut <- bind_rows(lapply(vars_or, or_brut))
-print(tab_or_brut %>% mutate(across(where(is.numeric), ~ round(.x, 3))), row.names = FALSE)
+biv_num <- function(var, label) {
+  x <- a[[var]]; g <- a$QFT; m <- sum(is.na(x))
+  med <- function(z) sprintf("%s [%s–%s]", f1(median(z, na.rm = TRUE)),
+                             f1(quantile(z, .25, na.rm = TRUE)), f1(quantile(z, .75, na.rm = TRUE)))
+  o <- crude_or(var)
+  data.frame(Variable = paste0(label, miss_txt(m)), Category = "median [IQR]; OR per year",
+             neg = med(x[g == "QFT-"]), pos = med(x[g == "QFT+"]), OR = fOR(o$or, o$lo, o$hi),
+             p = fp(wilcox.test(x ~ g, exact = FALSE)$p.value), Test = "Mann–Whitney")
+}
+biv_cat <- function(var, label) {
+  x <- a[[var]]; m <- sum(is.na(x)); tab <- table(x, a$QFT)
+  expected <- suppressWarnings(chisq.test(tab)$expected)
+  fisher <- any(expected < 5)
+  p <- if (fisher) fisher.test(tab, simulate.p.value = nrow(tab) > 2, B = 1e5)$p.value
+       else chisq.test(tab, correct = FALSE)$p.value
+  o <- crude_or(var); k <- nrow(tab)
+  data.frame(Variable = c(paste0(label, miss_txt(m)), rep("", k - 1)), Category = rownames(tab),
+             neg = sprintf("%d (%s)", tab[, "QFT-"], f1(100 * tab[, "QFT-"] / sum(tab[, "QFT-"]))),
+             pos = sprintf("%d (%s)", tab[, "QFT+"], f1(100 * tab[, "QFT+"] / sum(tab[, "QFT+"]))),
+             OR = c("1 (ref.)", fOR(o$or, o$lo, o$hi)), p = c(fp(p), rep("", k - 1)),
+             Test = c(ifelse(fisher, "Fisher", "Chi²"), rep("", k - 1)))
+}
 
-## 6. Q3 – Régression logistique multivariable ---------------------------------
-# 6.1 Choix des variables A PRIORI (connaissances, pas p-values)
-#   Âge (exposition cumulée), sexe, exposition déclarée à la tuberculose,
-#   procédures générant des aérosols, port régulier du masque, vaccination BCG.
-#   Le QFT n'est pas faussé par le BCG (antigènes ESAT-6/CFP-10 absents du BCG) ;
-#   le BCG est inclus comme facteur potentiellement protecteur contre l'infection.
-#   L'ancienneté n'est pas incluse : fortement liée à l'âge et 16 % manquante.
-vars_mod <- c("age", "sexe", "exposition", "pgae", "masque_reg", "bcg")
-f_mod <- reformulate(vars_mod, "qft_pos")
+set.seed(SEED)   # Monte Carlo p-values (occupation, department)
+table3 <- rbind(
+  biv_num("age", "Age (years)"),
+  biv_cat("age_group", "Age group"),
+  biv_cat("sex", "Sex"),
+  biv_cat("occupation_grp", "Occupation"),
+  biv_cat("department_grp", "Department"),
+  biv_num("experience", "Professional experience (years)"),
+  biv_cat("tb_exposure", "Self-reported TB exposure"),
+  biv_cat("agp", "Aerosol-generating procedures"),
+  biv_cat("specimen", "Specimen handling"),
+  biv_cat("mask4", "Mask use"),
+  biv_cat("biosafety_training", "Biosafety training"),
+  biv_cat("bcg", "BCG vaccination"),
+  biv_cat("bcg_scar", "BCG scar"),
+  biv_cat("smoking", "Current or former smoker"),
+  biv_cat("tb_history", "History of tuberculosis"),
+  biv_cat("covid_history", "History of COVID-19")
+)
+rownames(table3) <- NULL
+names(table3) <- c("Variable", "Category", sprintf("QFT− (n = %d)", n_neg),
+                   sprintf("QFT+ (n = %d)", n_pos), "Crude OR (95% CI)", "p", "Test")
 
-# 6.2 Nombre d'événements par paramètre (EPV)
+# Cochran-Armitage test for trend across the ordered mask-use categories
+tm <- table(a$mask4, a$QFT)
+p_trend_mask <- prop.trend.test(tm[, "QFT+"], rowSums(tm))$p.value
+cat("Cochran–Armitage test for trend (mask use): p =", round(p_trend_mask, 3), "\n")
+
+
+## 7. Q3 – MULTIVARIABLE LOGISTIC REGRESSION ===================================
+# 7.1 Variables chosen A PRIORI on clinical and epidemiological grounds
+#     (not on p-values): age (cumulative exposure), sex, self-reported TB
+#     exposure, aerosol-generating procedures, regular mask use, BCG vaccination.
+#     QFT is not affected by BCG (ESAT-6/CFP-10 antigens are absent from BCG).
+#     Experience: strongly related to age and 16.5% missing -> not included.
+#     Occupation/department: 9 extra parameters -> not enough events.
+model_vars <- c("age", "sex", "tb_exposure", "agp", "mask_regular", "bcg")
+f_model <- reformulate(model_vars, "qft_pos")
 n_param <- 6
-cat("\nÉvénements (QFT+) :", n_pos, "| paramètres :", n_param,
-    "| EPV =", round(n_pos / n_param, 1), "\n")
+cat("\nEvents per parameter (all participants):", round(n_pos / n_param, 1), "\n")
 
-# 6.3 Analyse en cas complets
-cc <- a %>% select(qft_pos, all_of(vars_mod)) %>% na.omit()
-cat("Cas complets : n =", nrow(cc), "| événements =", sum(cc$qft_pos),
+# 7.2 Complete-case model
+cc <- a %>% select(qft_pos, all_of(model_vars)) %>% na.omit()
+cat("Complete cases: n =", nrow(cc), "| events =", sum(cc$qft_pos),
     "| EPV =", round(sum(cc$qft_pos) / n_param, 1), "\n")
-m_cc <- glm(f_mod, data = cc, family = binomial)
+m_cc <- glm(f_model, data = cc, family = binomial)
+res_cc <- broom::tidy(m_cc, conf.int = TRUE, exponentiate = TRUE, conf.method = "profile") %>%
+  filter(term != "(Intercept)") %>%
+  transmute(method = "Complete cases", term, OR = estimate, lo = conf.low, hi = conf.high, p = p.value)
 
-tidy_or <- function(m, methode) {
-  t <- broom::tidy(m, conf.int = TRUE, exponentiate = TRUE, conf.method = "profile")
-  t %>% filter(term != "(Intercept)") %>%
-    transmute(Methode = methode, Terme = term, OR = estimate,
-              IC_bas = conf.low, IC_haut = conf.high, p = p.value)
-}
-res_cc <- tidy_or(m_cc, "Cas complets (MV)")
-
-# 6.4 Diagnostics du modèle
-# Colinéarité
-print(car::vif(m_cc))
-# Linéarité de l'âge sur le logit : spline cubique restreinte (3 nœuds) vs linéaire
+# 7.3 Diagnostics
+vif_values <- car::vif(m_cc); print(vif_values)
 dd <- datadist(cc); options(datadist = "dd")
-m_lin <- lrm(f_mod, data = cc, x = TRUE, y = TRUE)
-m_rcs <- lrm(qft_pos ~ rcs(age, 3) + sexe + exposition + pgae + masque_reg + bcg, data = cc)
-p_lin <- 1 - pchisq(m_rcs$stats["Model L.R."] - m_lin$stats["Model L.R."], 1)
-cat("Test de non-linéarité de l'âge : p =", signif(p_lin, 3), "\n")
-# Observations influentes
-infl <- which(cooks.distance(m_cc) > 4 / nrow(cc))
-cat("Observations avec distance de Cook > 4/n :", length(infl), "\n")
+m_lin <- lrm(f_model, data = cc, x = TRUE, y = TRUE)
+m_rcs <- lrm(qft_pos ~ rcs(age, 3) + sex + tb_exposure + agp + mask_regular + bcg, data = cc)
+p_nonlin_age <- 1 - pchisq(m_rcs$stats["Model L.R."] - m_lin$stats["Model L.R."], 1)
+n_influential <- sum(cooks.distance(m_cc) > 4 / nrow(cc))
+cat("Non-linearity of age: p =", round(p_nonlin_age, 3),
+    "| observations with Cook's distance > 4/n:", n_influential, "\n")
 
-# 6.5 Performance : discrimination, calibration, validation interne
-roc_cc <- roc(cc$qft_pos, fitted(m_cc), quiet = TRUE, ci = TRUE)
-cat("AUC apparente =", sprintf("%.3f (IC95 %.3f–%.3f)", roc_cc$auc,
-                                roc_cc$ci[1], roc_cc$ci[3]), "\n")
-# Test global d'ajustement de le Cessie–van Houwelingen (alternative à Hosmer-Lemeshow)
-gof <- residuals(m_lin, type = "gof"); print(gof)
-# Hosmer–Lemeshow (10 groupes), codé directement
+# 7.4 Performance: discrimination, calibration, internal validation
+roc_cc <- roc(cc$qft_pos, fitted(m_cc), quiet = TRUE, ci = TRUE)       # DeLong CI
 hosmer_lemeshow <- function(y, p, g = 10) {
   grp <- cut(p, unique(quantile(p, seq(0, 1, length.out = g + 1))), include.lowest = TRUE)
-  obs <- tapply(y, grp, sum); att <- tapply(p, grp, sum); n <- tapply(y, grp, length)
-  stat <- sum((obs - att)^2 / (att * (1 - att / n)))
-  c(chi2 = stat, ddl = nlevels(grp) - 2, p = 1 - pchisq(stat, nlevels(grp) - 2))
+  obs <- tapply(y, grp, sum); expd <- tapply(p, grp, sum); n <- tapply(y, grp, length)
+  stat <- sum((obs - expd)^2 / (expd * (1 - expd / n)))
+  c(chi2 = stat, df = nlevels(grp) - 2, p = 1 - pchisq(stat, nlevels(grp) - 2))
 }
-print(hosmer_lemeshow(cc$qft_pos, fitted(m_cc)))
-# Validation interne par bootstrap (B = 500) : optimisme de l'AUC et pente de calibration
-val <- validate(m_lin, method = "boot", B = 500)
-auc_corr <- 0.5 + val["Dxy", "index.corrected"] / 2
-cat("AUC corrigée de l'optimisme =", round(auc_corr, 3),
-    "| pente de calibration corrigée =", round(val["Slope", "index.corrected"], 3), "\n")
+hl  <- hosmer_lemeshow(cc$qft_pos, fitted(m_cc))
+gof <- residuals(m_lin, type = "gof")                  # le Cessie–van Houwelingen
+brier      <- mean((fitted(m_cc) - cc$qft_pos)^2)
+brier_null <- mean(cc$qft_pos) * (1 - mean(cc$qft_pos))
+val <- validate(m_lin, method = "boot", B = 500)       # bootstrap, 500 resamples
+auc_corrected   <- 0.5 + val["Dxy", "index.corrected"] / 2
+slope_corrected <- val["Slope", "index.corrected"]
 cal <- calibrate(m_lin, method = "boot", B = 500)
-brier <- mean((fitted(m_cc) - cc$qft_pos)^2)
-cat("Score de Brier =", round(brier, 3), "\n")
 
-# 6.6 Régression de Firth (biais des petits effectifs) – sensibilité
-m_firth <- glm(f_mod, data = cc, family = binomial, method = "brglmFit", type = "AS_mean")
+# 7.5 Firth bias-reduced logistic regression (sensitivity analysis)
+m_firth <- glm(f_model, data = cc, family = binomial, method = "brglmFit", type = "AS_mean")
 res_firth <- suppressWarnings(broom::tidy(m_firth)) %>% filter(term != "(Intercept)") %>%
-  transmute(Methode = "Firth (cas complets)", Terme = term, OR = exp(estimate),
-            IC_bas = exp(estimate - 1.96 * std.error), IC_haut = exp(estimate + 1.96 * std.error),
-            p = p.value)
+  transmute(method = "Firth penalised", term, OR = exp(estimate),
+            lo = exp(estimate - 1.96 * std.error), hi = exp(estimate + 1.96 * std.error), p = p.value)
 
-# 6.7 Imputation multiple (analyse principale ; hypothèse MAR)
-vars_imp <- c("qft_pos", vars_mod, "experience", "profession_g", "service_g", "formation", "tabac")
-imp_data <- a %>% select(all_of(vars_imp))
-imp <- mice(imp_data, m = 30, maxit = 20, printFlag = FALSE, seed = 2026)
-fit_mi <- with(imp, glm(qft_pos ~ age + sexe + exposition + pgae + masque_reg + bcg, family = binomial))
-pool_mi <- as.data.frame(summary(pool(fit_mi), conf.int = TRUE))
-res_mi <- pool_mi %>% filter(term != "(Intercept)") %>%
-  transmute(Methode = "Imputation multiple (principale)", Terme = as.character(term),
-            OR = exp(estimate), IC_bas = exp(`2.5 %`), IC_haut = exp(`97.5 %`), p = p.value)
-
+# 7.6 Multiple imputation by chained equations (PRIMARY analysis; MAR assumption)
+imp_vars <- c("qft_pos", model_vars, "experience", "occupation_grp", "department_grp",
+              "biosafety_training", "smoking")
+imp <- mice(a %>% select(all_of(imp_vars)), m = 30, maxit = 20, printFlag = FALSE, seed = SEED)
+fit_mi <- with(imp, glm(qft_pos ~ age + sex + tb_exposure + agp + mask_regular + bcg, family = binomial))
+res_mi <- as.data.frame(summary(pool(fit_mi), conf.int = TRUE)) %>% filter(term != "(Intercept)") %>%
+  transmute(method = "Multiple imputation", term = as.character(term), OR = exp(estimate),
+            lo = exp(`2.5 %`), hi = exp(`97.5 %`), p = p.value)
 res_multi <- bind_rows(res_mi, res_cc, res_firth)
-print(as.data.frame(res_multi) %>% mutate(across(where(is.numeric), ~ round(.x, 3))), row.names = FALSE)
 
-# 6.8 Sensibilité : ajout du service (modèle exploratoire, mêmes patients)
-d_s <- a %>% select(qft_pos, all_of(vars_mod), service_g) %>% na.omit()
-m_sans <- glm(f_mod, data = d_s, family = binomial)
-m_avec <- update(m_sans, . ~ . + service_g)
-p_service <- anova(m_sans, m_avec, test = "LRT")[2, "Pr(>Chi)"]
-cat("Ajout du service au modèle (LRT, 5 ddl) : p =", signif(p_service, 3), "\n")
+# 7.7 Sensitivity analysis: adding department (likelihood ratio test, same participants)
+d_dep <- a %>% select(qft_pos, all_of(model_vars), department_grp) %>% na.omit()
+m_without <- glm(f_model, data = d_dep, family = binomial)
+m_with    <- update(m_without, . ~ . + department_grp)
+p_department <- anova(m_without, m_with, test = "LRT")[2, "Pr(>Chi)"]
+cat("Adding department to the model (LRT, 5 df): p =", round(p_department, 3), "\n")
 
-## 7. Figures -------------------------------------------------------------------
-# 7.1 Prévalence du QFT+ par service (IC95 de Wilson)
-prev_serv <- a %>% filter(!is.na(service_g)) %>% group_by(service_g) %>%
-  summarise(n = n(), pos = sum(qft_pos), .groups = "drop") %>%
-  rowwise() %>%
-  mutate(prev = pos / n,   # IC de Wilson (avertissement normal pour les petits effectifs)
-         bas  = suppressWarnings(prop.test(pos, n, correct = FALSE)$conf.int[1]),
-         haut = suppressWarnings(prop.test(pos, n, correct = FALSE)$conf.int[2])) %>% ungroup()
-g1 <- ggplot(prev_serv, aes(x = reorder(service_g, prev), y = 100 * prev)) +
-  geom_pointrange(aes(ymin = 100 * bas, ymax = 100 * haut)) +
-  geom_hline(yintercept = 100 * n_pos / n_tot, linetype = 2) +
-  geom_text(aes(label = paste0(pos, "/", n)), nudge_x = 0.3, size = 3) +
-  coord_flip() + labs(x = NULL, y = "Prévalence QFT+ (%) et IC à 95 %",
-  title = "Prévalence de l'ITL par service", subtitle = "Ligne pointillée : prévalence globale") +
-  theme_minimal(base_size = 11)
-ggsave(file.path(dossier, "fig1_prevalence_service.png"), g1, width = 7, height = 4.5, dpi = 300, bg = "white")
+# Table 4 – adjusted odds ratios by estimation method
+term_labels <- c(age = "Age (per year)", sexMale = "Male vs female",
+  tb_exposureYes = "Self-reported TB exposure (yes vs no)",
+  agpYes = "Aerosol-generating procedures (yes vs no)",
+  mask_regularIrregular = "Irregular vs regular mask use", bcgNo = "Not BCG vaccinated vs vaccinated")
+cell <- function(df, t) with(df[df$term == t, ], sprintf("%s; %s", fOR(OR, lo, hi), fp(p)))
+table4 <- data.frame(
+  Variable = unname(term_labels),
+  `Multiple imputation (primary), n = 164` = sapply(names(term_labels), cell, df = res_mi),
+  `Complete cases, n = 123` = sapply(names(term_labels), cell, df = res_cc),
+  `Firth penalised, n = 123` = sapply(names(term_labels), cell, df = res_firth),
+  check.names = FALSE)
+names(table4)[2:4] <- c(sprintf("Multiple imputation (primary), n = %d", n_tot),
+                        sprintf("Complete cases, n = %d", nrow(cc)),
+                        sprintf("Firth penalised, n = %d", nrow(cc)))
+rownames(table4) <- NULL
 
-# 7.2 Forest plot des OR ajustés (imputation multiple)
-noms_termes <- c(age = "Âge (par année)", sexeHomme = "Homme vs femme",
-  expositionOui = "Exposition déclarée à la TB", pgaeOui = "Procédures générant des aérosols",
-  "masque_regIrrégulier" = "Port du masque irrégulier", bcgNon = "Non vacciné BCG")
-g2 <- res_multi %>% mutate(Terme = noms_termes[Terme]) %>%
-  ggplot(aes(x = OR, y = Terme, colour = Methode)) +
-  geom_vline(xintercept = 1, linetype = 2) +
-  geom_pointrange(aes(xmin = IC_bas, xmax = IC_haut), position = position_dodge(width = 0.6)) +
-  scale_x_log10() + labs(x = "Odds ratio ajusté (échelle log) et IC à 95 %", y = NULL, colour = NULL,
-  title = "Facteurs associés au QFT+ : modèle multivariable") +
-  theme_minimal(base_size = 11) + theme(legend.position = "bottom", legend.direction = "vertical")
-ggsave(file.path(dossier, "fig2_forest_plot.png"), g2, width = 7.5, height = 5.5, dpi = 300, bg = "white")
+# Table 5 – model diagnostics and performance
+table5 <- data.frame(
+  Indicator = c("Events per parameter", "Maximum variance inflation factor",
+                "Non-linearity of age (restricted cubic spline, 3 knots)",
+                "Influential observations (Cook's distance > 4/n)", "Apparent AUC (95% CI, DeLong)",
+                "Optimism-corrected AUC (500 bootstrap resamples)", "Optimism-corrected calibration slope",
+                "Hosmer–Lemeshow test (10 groups)", "le Cessie–van Houwelingen test", "Brier score"),
+  Value = c(sprintf("%s (%s with imputation)", f1(sum(cc$qft_pos) / n_param), f1(n_pos / n_param)),
+            f2(max(vif_values)), sprintf("p = %s", f2(p_nonlin_age)), as.character(n_influential),
+            sprintf("%s (%s–%s)", f2(roc_cc$auc), f2(roc_cc$ci[1]), f2(roc_cc$ci[3])),
+            f2(auc_corrected), f2(slope_corrected), sprintf("p = %s", f2(hl["p"])),
+            sprintf("p = %s", f2(gof["P"])),
+            sprintf("%s (null model %s)", formatC(brier, format = "f", digits = 3),
+                    formatC(brier_null, format = "f", digits = 3))),
+  Interpretation = c("Acceptable for six parameters", "No multicollinearity", "Linear effect of age adequate",
+                     "Expected number; results stable across methods", "Poor discrimination",
+                     "Poor discrimination", "Moderate overfitting", "No significant lack of fit",
+                     "No significant lack of fit", "Small improvement over no model"))
+print(table4); print(table5)
 
-# 7.3 Courbe ROC et 7.4 courbe de calibration (bootstrap)
-png(file.path(dossier, "fig3_roc.png"), width = 1600, height = 1600, res = 300, bg = "white")
-plot(roc_cc, print.auc = TRUE, legacy.axes = TRUE, main = "Courbe ROC (cas complets)")
-dev.off()
-png(file.path(dossier, "fig4_calibration.png"), width = 1800, height = 1600, res = 300, bg = "white")
-plot(cal, main = "Calibration (bootstrap, B = 500)", xlab = "Probabilité prédite", ylab = "Proportion observée")
-dev.off()
 
-## 8. Export des tableaux --------------------------------------------------------
-arrondir <- function(df) df %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
-perf <- data.frame(
-  Indicateur = c("n (cas complets)", "Événements", "EPV", "AUC apparente", "IC95 AUC",
-                 "AUC corrigée (bootstrap)", "Pente de calibration corrigée",
-                 "Hosmer-Lemeshow p", "le Cessie-van Houwelingen p", "Score de Brier",
-                 "Non-linéarité de l'âge p", "VIF maximal", "Ajout du service (LRT) p"),
-  Valeur = c(nrow(cc), sum(cc$qft_pos), round(sum(cc$qft_pos) / n_param, 1), round(roc_cc$auc, 3),
-             sprintf("%.3f–%.3f", roc_cc$ci[1], roc_cc$ci[3]), round(auc_corr, 3),
-             round(val["Slope", "index.corrected"], 3),
-             round(hosmer_lemeshow(cc$qft_pos, fitted(m_cc))["p"], 3), round(gof["P"], 3),
-             round(brier, 3), round(p_lin, 3), round(max(car::vif(m_cc)), 2), round(p_service, 3)))
-wb <- list("Données manquantes" = manq, "Prévalence" = prevalence,
-           "Bivarié quantitatif" = arrondir(desc_num), "Bivarié qualitatif" = arrondir(desc_cat),
-           "OR bruts" = arrondir(tab_or_brut), "OR ajustés" = arrondir(as.data.frame(res_multi)),
-           "Performance modèle" = perf)
-openxlsx::write.xlsx(wb, file.path(dossier, "tableaux_resultats.xlsx"))
+## 8. FIGURES ==================================================================
+col_qft <- c("QFT-" = "#4C72B0", "QFT+" = "#C44E52")
+th <- theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold", size = 11), panel.grid.minor = element_blank())
+save_fig <- function(g, file, w, h, dir = fig_dir)
+  ggsave(file.path(dir, file), g, width = w, height = h, dpi = 300, bg = "white")
 
-## 9. Reproductibilité -----------------------------------------------------------
-writeLines(capture.output(sessionInfo()), file.path(dossier, "sessionInfo.txt"))
-cat("\nAnalyse terminée. Résultats dans le dossier :", dossier, "\n")
+# Figure 1 – flow diagram (STROBE item 13c)
+n_raw <- nrow(d); n_indet <- sum(is.na(d$qft_pos))
+boxes <- data.frame(
+  x = c(4, 8.3, 4, 2.2, 5.8, 4), y = c(9.1, 7.4, 5.85, 3.55, 3.55, 1.35),
+  w = c(5.6, 3.0, 5.6, 3.2, 3.2, 6.8), h = c(1.0, 1.0, 1.0, 1.0, 1.0, 1.3),
+  fill = c("white", "grey95", "white", "#F8DCDC", "#DCE6F2", "white"),
+  label = c(sprintf("Healthcare workers enrolled and tested\nwith QuantiFERON (n = %d)", n_raw),
+            sprintf("Excluded:\nindeterminate QFT result\n(n = %d)", n_indet),
+            sprintf("Participants analysed (n = %d)\nbivariate analysis and multiple imputation", n_tot),
+            sprintf("QFT positive\n(LTBI) n = %d", n_pos), sprintf("QFT negative\nn = %d", n_neg),
+            sprintf(paste0("Complete-case sensitivity analyses (n = %d; %d QFT+)\n",
+                           "%d participants with ≥ 1 missing value among model variables\n",
+                           "(mask use %d, BCG vaccination %d, TB exposure %d; overlapping)"),
+                    nrow(cc), sum(cc$qft_pos), n_tot - nrow(cc), sum(is.na(a$mask_regular)),
+                    sum(is.na(a$bcg)), sum(is.na(a$tb_exposure)))),
+  bold = c(TRUE, FALSE, TRUE, FALSE, FALSE, FALSE))
+arrows_df <- data.frame(x = c(4, 6.0, 4, 4), y = c(8.6, 7.4, 5.35, 5.35),
+                        xend = c(4, 6.8, 2.2, 5.8), yend = c(6.35, 7.4, 4.05, 4.05))
+fig1 <- ggplot() +
+  geom_rect(data = boxes, aes(xmin = x - w / 2, xmax = x + w / 2, ymin = y - h / 2, ymax = y + h / 2,
+                              fill = fill), colour = "grey20") +
+  scale_fill_identity() +
+  geom_text(data = boxes, aes(x, y, label = label, fontface = ifelse(bold, "bold", "plain")), size = 3.4) +
+  geom_segment(aes(x = 4, y = 7.4, xend = 6.0, yend = 7.4), colour = "grey20") +
+  geom_segment(data = arrows_df, aes(x, y, xend = xend, yend = yend), colour = "grey20",
+               arrow = arrow(length = unit(0.15, "cm"), type = "closed")) +
+  geom_segment(aes(x = 4, y = 3.05, xend = 4, yend = 2.0), colour = "grey20", linetype = 2) +
+  coord_cartesian(xlim = c(0, 10), ylim = c(0.5, 9.8)) + theme_void()
+save_fig(fig1, "Figure1_flow_diagram.png", 7.5, 6.2)
 
-## 10. Graphics
-dir_fig <- file.path(dossier, "figures_descriptives")
-dir.create(dir_fig, showWarnings = FALSE)
-theme_set(theme_minimal(base_size = 11))
-sauver <- function(g, nom, w = 7, h = 4.5) {
-  ggsave(file.path(dir_fig, nom), g, width = w, height = h, dpi = 300, bg = "white")
+# Figure 2 – descriptive overview by QFT result (panels A–F)
+pA <- a %>% count(res = QFT) %>% mutate(pct = 100 * n / sum(n)) %>%
+  ggplot(aes(res, n, fill = res)) + geom_col(width = 0.55) +
+  geom_text(aes(label = sprintf("%d\n(%.1f%%)", n, pct)), vjust = -0.2, size = 3.4) +
+  scale_fill_manual(values = col_qft, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.25))) +
+  labs(x = NULL, y = "Participants", title = "A. QuantiFERON result",
+       subtitle = sprintf("LTBI prevalence: %.1f%% (95%% CI %.1f–%.1f)",
+                          100 * n_pos / n_tot, ci_wilson[1], ci_wilson[2])) + th
+pB <- ggplot(a, aes(age, fill = QFT)) +
+  geom_histogram(binwidth = 2, boundary = 18, colour = "white") +
+  geom_vline(xintercept = median(a$age), linetype = 2) + scale_fill_manual(values = col_qft) +
+  labs(x = "Age (years)", y = "Participants", fill = NULL, title = "B. Age distribution",
+       subtitle = sprintf("Median %.0f years [IQR %.0f–%.0f]; %.0f%% women", median(a$age),
+                          quantile(a$age, .25), quantile(a$age, .75), 100 * mean(a$sex == "Female"))) +
+  th + theme(legend.position = "top")
+bars_by <- function(var, title) {
+  df <- a %>% filter(!is.na(.data[[var]])) %>% count(grp = .data[[var]], QFT)
+  tot <- df %>% group_by(grp) %>% summarise(pos = sum(n[QFT == "QFT+"]), n = sum(n), .groups = "drop") %>%
+    mutate(lab = sprintf("n=%d · %.0f%% QFT+", n, 100 * pos / n))
+  ggplot(df, aes(y = reorder(grp, n, sum), x = n, fill = QFT)) + geom_col(width = 0.7) +
+    geom_text(data = tot, inherit.aes = FALSE, aes(y = grp, x = n, label = lab), hjust = -0.05, size = 2.8) +
+    scale_fill_manual(values = col_qft, guide = "none") +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.55))) +
+    labs(x = "Participants", y = NULL, title = title) + th
 }
-couleurs_qft <- c("QFT-" = "#4C72B0", "QFT+" = "#C44E52")
+pC <- bars_by("occupation_grp", "C. Occupation")
+pD <- bars_by("department_grp", "D. Department")
+binary_vars <- c(tb_exposure = "Self-reported TB exposure", agp = "Aerosol-generating procedures",
+                 specimen = "Specimen handling", bcg = "BCG vaccinated", bcg_scar = "BCG scar present",
+                 biosafety_training = "Biosafety training", mask_regular = "Regular mask use",
+                 smoking = "Current or former smoker", covid_history = "History of COVID-19")
+yes_level <- c(tb_exposure = "Yes", agp = "Yes", specimen = "Yes", bcg = "Yes", bcg_scar = "Present",
+               biosafety_training = "Yes", mask_regular = "Regular", smoking = "Yes", covid_history = "Yes")
+pE_df <- lapply(names(binary_vars), function(v) {
+  a %>% filter(!is.na(.data[[v]])) %>% group_by(QFT) %>%
+    summarise(pct = 100 * mean(.data[[v]] == yes_level[v]), .groups = "drop") %>%
+    mutate(variable = binary_vars[v], miss = sum(is.na(a[[v]])))
+}) %>% bind_rows() %>%
+  mutate(variable = ifelse(miss > 0, sprintf("%s (%d missing)", variable, miss), variable))
+order_E <- pE_df %>% group_by(variable) %>% summarise(m = mean(pct)) %>% arrange(m) %>% pull(variable)
+pE <- pE_df %>% mutate(variable = factor(variable, order_E), QFT = factor(QFT, c("QFT+", "QFT-"))) %>%
+  ggplot(aes(x = pct, y = variable, fill = QFT)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = sprintf("%.0f%%", pct)), position = position_dodge(width = 0.8), hjust = -0.15, size = 3) +
+  scale_fill_manual(values = col_qft, breaks = c("QFT-", "QFT+"),
+                    labels = c(sprintf("QFT- participants (n = %d)", n_neg), sprintf("QFT+ participants (n = %d)", n_pos))) +
+  scale_x_continuous(limits = c(0, 108), breaks = seq(0, 100, 25), labels = function(x) paste0(x, "%"),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(x = "Participants answering 'yes' (%)", y = NULL, fill = NULL,
+       title = "E. Exposure, prevention and medical history by QFT result",
+       subtitle = "Each pair of bars compares QFT- and QFT+ participants; missing answers excluded from percentages") +
+  th + theme(legend.position = "top", panel.grid.major.y = element_blank())
+pF_df <- a %>% filter(!is.na(mask4)) %>% count(mask4, QFT) %>% group_by(mask4) %>%
+  mutate(pct = 100 * n / sum(n), tot = sum(n)) %>% ungroup()
+pF <- ggplot(pF_df, aes(mask4, pct, fill = QFT)) + geom_col(width = 0.7) +
+  geom_text(data = filter(pF_df, QFT == "QFT+"), aes(y = pct / 2, label = sprintf("%.0f%%", pct)),
+            colour = "white", size = 3) +
+  geom_text(data = distinct(pF_df, mask4, tot), inherit.aes = FALSE,
+            aes(mask4, 104, label = paste0("n=", tot)), size = 2.8) +
+  scale_fill_manual(values = col_qft, guide = "none") +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), breaks = c(0, 50, 100)) +
+  labs(x = NULL, y = "Participants (%)", title = "F. Mask use",
+       subtitle = sprintf("%d missing; white figure = %% QFT+", sum(is.na(a$mask4)))) + th
+fig2 <- wrap_elements(pA | pB | pF) / wrap_elements(pC | pD) / wrap_elements(pE) +
+  plot_layout(heights = c(1, 1.1, 1.5)) +
+  plot_annotation(caption = sprintf(paste("n = %d participants. Blue = QFT-, red = QFT+.",
+    "Percentages on available data; Wilson 95%% CI."), n_tot))
+save_fig(fig2, "Figure2_descriptive_overview.png", 14, 15)
 
-## 10.1 Tableau descriptif global des variables quantitatives -------------------
-desc_quanti <- lapply(vars_num, function(v) {
-  x <- a[[v]]; xn <- x[!is.na(x)]
-  data.frame(
-    Variable   = unname(libelles[v]),
-    n          = length(xn),
-    Manquants  = sum(is.na(x)),
-    Moyenne    = mean(xn),
-    Ecart_type = sd(xn),
-    Mediane    = median(xn),
-    Q1         = unname(quantile(xn, 0.25)),
-    Q3         = unname(quantile(xn, 0.75)),
-    Minimum    = min(xn),
-    Maximum    = max(xn),
-    Asymetrie  = mean((xn - mean(xn))^3) / sd(xn)^3,     # > 1 : forte asymétrie à droite
-    Shapiro_p  = shapiro.test(xn)$p.value)               # < 0,05 : distribution non normale
-}) %>% bind_rows()
-print(desc_quanti %>% mutate(across(where(is.numeric), ~ round(.x, 2))), row.names = FALSE)
-
-## 10.2 Tableau descriptif global des variables qualitatives --------------------
-desc_quali <- lapply(vars_cat, function(v) {
-  x <- a[[v]]; tab <- table(x)
-  data.frame(Variable = unname(libelles[v]), Modalite = names(tab),
-             n = as.integer(tab),
-             Pourcentage = round(100 * as.integer(tab) / sum(tab), 1),   # sur les répondants
-             Manquants = c(sum(is.na(x)), rep(NA, length(tab) - 1)))
-}) %>% bind_rows()
-print(desc_quali, row.names = FALSE)
-
-## 10.3 Distribution des variables quantitatives : histogramme + densité --------
-#      (la ligne rouge = moyenne, la ligne bleue = médiane)
-for (v in vars_num) {
-  df <- a %>% filter(!is.na(.data[[v]]))
-  g <- ggplot(df, aes(x = .data[[v]])) +
-    geom_histogram(aes(y = after_stat(density)), bins = 20, fill = "grey75", colour = "white") +
-    geom_density(linewidth = 0.8) +
-    geom_vline(xintercept = mean(df[[v]]), colour = "#C44E52", linetype = 2) +
-    geom_vline(xintercept = median(df[[v]]), colour = "#4C72B0", linetype = 2) +
-    labs(x = libelles[v], y = "Densité",
-         title = paste("Distribution :", libelles[v]),
-         subtitle = sprintf("n = %d ; moyenne (rouge) = %.1f ; médiane (bleu) = %.1f",
-                            nrow(df), mean(df[[v]]), median(df[[v]])))
-  sauver(g, paste0("histogramme_", v, ".png"))
+# Figure 3 – prevalence by department and occupation
+prev_plot <- function(df, title) {
+  ggplot(df, aes(reorder(group, prevalence), prevalence)) +
+    geom_hline(yintercept = 100 * n_pos / n_tot, linetype = 2, colour = "grey40") +
+    geom_pointrange(aes(ymin = ci_low, ymax = ci_high), colour = "#C44E52") +
+    geom_text(aes(label = paste0(positive, "/", n)), nudge_x = 0.3, size = 3) +
+    coord_flip() + scale_y_continuous(limits = c(0, 100)) +
+    labs(x = NULL, y = "QFT+ prevalence (%) with 95% CI", title = title) + th
 }
+fig3 <- (prev_plot(prev_department, "A. By department") | prev_plot(prev_occupation, "B. By occupation")) +
+  plot_annotation(caption = sprintf("Dashed line: overall prevalence (%.1f%%). Wilson 95%% confidence intervals.",
+                                    100 * n_pos / n_tot))
+save_fig(fig3, "Figure3_prevalence_department_occupation.png", 12, 4.5)
 
-## 10.4 Q-Q plots : vérification visuelle de la normalité -----------------------
-qq <- a %>% select(all_of(vars_num)) %>%
-  pivot_longer(everything(), names_to = "variable", values_to = "valeur") %>%
-  filter(!is.na(valeur)) %>% mutate(variable = libelles[variable])
-g_qq <- ggplot(qq, aes(sample = valeur)) + stat_qq() + stat_qq_line(colour = "#C44E52") +
+# Figure 4 – forest plot of adjusted odds ratios (three estimation methods)
+method_labels <- c("Multiple imputation" = sprintf("Multiple imputation (primary, n = %d)", n_tot),
+                   "Complete cases" = sprintf("Complete cases (n = %d)", nrow(cc)),
+                   "Firth penalised" = sprintf("Firth penalised (n = %d)", nrow(cc)))
+forest_labels <- c(age = "Age (per year)", sexMale = "Male vs female", tb_exposureYes = "Self-reported TB exposure",
+                   agpYes = "Aerosol-generating procedures", mask_regularIrregular = "Irregular vs regular mask use",
+                   bcgNo = "Not BCG vaccinated")
+fig4 <- res_multi %>%
+  mutate(term = factor(forest_labels[term], rev(forest_labels)),
+         method = factor(method_labels[method], method_labels)) %>%
+  ggplot(aes(OR, term, colour = method)) + geom_vline(xintercept = 1, linetype = 2) +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.6)) +
+  scale_x_log10(breaks = c(0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8)) +
+  scale_colour_manual(values = c("#C44E52", "#4C72B0", "#55A868")) +
+  labs(x = "Adjusted odds ratio (log scale) with 95% CI", y = NULL, colour = NULL) +
+  th + theme(legend.position = "bottom", legend.direction = "vertical")
+save_fig(fig4, "Figure4_forest_plot.png", 8, 5.5)
+
+# Figure 5 – model performance: ROC curve and bootstrap calibration
+p5a <- pROC::ggroc(roc_cc, legacy.axes = TRUE, colour = "#C44E52", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+  annotate("text", x = 0.62, y = 0.15, size = 3.4,
+           label = sprintf("AUC %.2f (95%% CI %.2f–%.2f)\nOptimism-corrected AUC %.2f",
+                           roc_cc$auc, roc_cc$ci[1], roc_cc$ci[3], auc_corrected)) +
+  coord_equal() + labs(x = "1 – specificity", y = "Sensitivity", title = "A. ROC curve") + th
+cal_df <- data.frame(pred = cal[, "predy"], apparent = cal[, "calibrated.orig"],
+                     corrected = cal[, "calibrated.corrected"]) %>%
+  pivot_longer(-pred, names_to = "type", values_to = "obs") %>%
+  mutate(type = factor(type, c("apparent", "corrected"), c("Apparent", "Bias-corrected (bootstrap)")))
+p5b <- ggplot(cal_df, aes(pred, obs, linetype = type)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50") +
+  geom_line(colour = "#4C72B0", linewidth = 0.9) + coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  annotate("text", x = 0.68, y = 0.1, size = 3.4,
+           label = sprintf("Corrected calibration slope %.2f", slope_corrected)) +
+  labs(x = "Predicted probability", y = "Observed proportion", linetype = NULL, title = "B. Calibration") +
+  th + theme(legend.position = "bottom")
+fig5 <- (p5a | p5b) + plot_annotation(caption = sprintf(paste("Complete-case model (n = %d); 500 bootstrap",
+  "resamples. Grey diagonal = chance (A) or perfect calibration (B)."), nrow(cc)))
+save_fig(fig5, "Figure5_model_performance.png", 11, 5.8)
+
+# Supplementary figures: distributions, Q-Q plots, missing-data map
+long_num <- a %>% select(QFT, age, experience) %>% pivot_longer(-QFT, names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>% mutate(variable = labels_en[variable])
+sA <- ggplot(long_num, aes(value)) + geom_histogram(bins = 20, fill = "grey70", colour = "white") +
+  facet_wrap(~ variable, scales = "free") + labs(x = NULL, y = "Participants", title = "Distributions") + th
+sB <- ggplot(long_num, aes(sample = value)) + stat_qq() + stat_qq_line(colour = "#C44E52") +
   facet_wrap(~ variable, scales = "free") +
-  labs(x = "Quantiles théoriques (loi normale)", y = "Quantiles observés",
-       title = "Q-Q plots : les points doivent suivre la droite si la distribution est normale")
-sauver(g_qq, "qqplot_quantitatives.png", w = 8, h = 4)
+  labs(x = "Theoretical quantiles", y = "Observed quantiles", title = "Normal Q-Q plots") + th
+save_fig(sA / sB, "S_distributions_qqplots.png", 8, 7, supp_dir)
+miss_map <- a %>% mutate(row = row_number()) %>% select(row, all_of(vars_missing)) %>%
+  mutate(across(-row, is.na)) %>% pivot_longer(-row, names_to = "variable", values_to = "missing") %>%
+  mutate(variable = factor(labels_en[variable], rev(labels_en[vars_missing])))
+sC <- ggplot(miss_map, aes(row, variable, fill = missing)) + geom_tile() +
+  scale_fill_manual(values = c(`FALSE` = "grey90", `TRUE` = "#C44E52"), labels = c("Recorded", "Missing")) +
+  labs(x = "Participant", y = NULL, fill = NULL, title = "Missing-data map") +
+  th + theme(legend.position = "top", panel.grid = element_blank())
+save_fig(sC, "S_missing_data_map.png", 9, 4.5, supp_dir)
 
-## 10.5 Boîtes à moustaches selon le résultat du QFT -----------------------------
-bx <- a %>% select(QFT, all_of(vars_num)) %>%
-  pivot_longer(-QFT, names_to = "variable", values_to = "valeur") %>%
-  filter(!is.na(valeur)) %>% mutate(variable = libelles[variable])
-g_box <- ggplot(bx, aes(x = QFT, y = valeur, fill = QFT)) +
-  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.6) +
-  geom_jitter(width = 0.12, alpha = 0.4, size = 1) +
-  facet_wrap(~ variable, scales = "free_y") +
-  scale_fill_manual(values = couleurs_qft, guide = "none") +
-  labs(x = NULL, y = NULL, title = "Âge et ancienneté selon le résultat du QFT",
-       subtitle = "Boîte = médiane et quartiles ; points = participants")
-sauver(g_box, "boxplots_selon_QFT.png", w = 8, h = 4.5)
 
-## 10.6 Répartition des variables qualitatives (diagrammes en barres) -----------
-vars_barres <- c("sexe", "age_cl", "profession_g", "service_g", "exposition", "masque",
-                 "formation", "bcg", "cicatrice", "tabac", "pgae", "atcd_covid")
-for (v in vars_barres) {
-  df <- a %>% count(modalite = .data[[v]]) %>%
-    mutate(modalite = fct_na_value_to_level(factor(modalite), "Manquant"),
-           pct = 100 * n / sum(n))
-  g <- ggplot(df, aes(x = modalite, y = n)) +
-    geom_col(fill = ifelse(df$modalite == "Manquant", "grey80", "#4C72B0")) +
-    geom_text(aes(label = sprintf("%d (%.0f %%)", n, pct)), vjust = -0.4, size = 3.2) +
-    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-    labs(x = NULL, y = "Effectif", title = libelles[v],
-         subtitle = paste("n =", nrow(a), "; les données manquantes sont en gris")) +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1))
-  sauver(g, paste0("barres_", v, ".png"))
+## 9. EXPORT OF TABLES (WORD AND EXCEL) ========================================
+ft_basic <- function(df, caption, note, widths, landscape_cols = NULL) {
+  ft <- flextable(df) %>% bold(part = "header") %>% set_caption(caption) %>%
+    add_footer_lines(note) %>% fontsize(size = 9, part = "all") %>% fontsize(size = 8, part = "footer") %>%
+    font(fontname = "Times New Roman", part = "all") %>%
+    padding(padding.top = 1, padding.bottom = 1, part = "all") %>%
+    align(j = seq_len(ncol(df))[-1], align = "center", part = "all") %>% border_outer()
+  for (j in seq_along(widths)) ft <- width(ft, j = j, width = widths[j])
+  ft
 }
+t2 <- table2
+ft2 <- ft_basic(t2[, 1:2] %>% rename(`n (%) or value` = Value),
+  sprintf("Table 2. Characteristics of the study population (n = %d)", n_tot),
+  paste("Values are n (%) unless otherwise stated; percentages are calculated on available data.",
+        "IQR, interquartile range; SD, standard deviation; EMT, emergency medical technician;",
+        "EMS, emergency medical services."), c(4.3, 2.0)) %>%
+  bold(i = which(t2$type == "section")) %>% bg(i = which(t2$type == "section"), bg = "#EEF2F7") %>%
+  italic(i = which(t2$type == "variable"))
+ft3 <- ft_basic(table3,
+  sprintf("Table 3. Characteristics of participants by QuantiFERON result, with crude odds ratios (n = %d)", n_tot),
+  paste("Values are n (column %) calculated on available data, or median [IQR]. p-values: Pearson chi-square",
+        "test when all expected counts were ≥ 5, otherwise Fisher's exact test (Monte Carlo p-value with 100,000",
+        "replicates for variables with more than two categories); Mann–Whitney U test for continuous variables.",
+        "For variables with more than two categories, the p-value is a global test. Crude OR: univariable logistic",
+        "regression with profile-likelihood 95% CI; ref., reference category. Because p-values and confidence",
+        "intervals are derived from different methods, they may disagree for estimates close to the 0.05 threshold."),
+  c(2.2, 1.8, 1.1, 1.1, 1.4, 0.6, 1.0)) %>% bold(j = 1, part = "body")
+ft4 <- ft_basic(table4, "Table 4. Factors associated with QFT positivity: multivariable logistic regression",
+  paste("Values are adjusted odds ratio (95% CI); p-value. All variables are mutually adjusted. Multiple",
+        "imputation by chained equations (30 imputed datasets, 20 iterations), pooled with Rubin's rules.",
+        "Complete-case estimates use profile-likelihood confidence intervals; Firth estimates use bias-reduced",
+        "logistic regression."), c(2.3, 1.45, 1.45, 1.45))
+ft5 <- ft_basic(table5, sprintf("Table 5. Diagnostics and performance of the multivariable model (complete cases, n = %d; %d events)",
+                                nrow(cc), sum(cc$qft_pos)),
+  "AUC, area under the receiver operating characteristic curve.", c(2.8, 1.7, 2.1))
+ftS1 <- ft_basic(table_S1, sprintf("Supplementary Table S1. Missing data by variable (n = %d)", n_tot),
+  "Medical history and high-risk practices: a blank answer was coded as \"none\".", c(3.5, 1.2, 1.2))
 
-## 10.7 Proportion de QFT+ selon chaque variable qualitative (barres empilées à 100 %)
-for (v in vars_barres) {
-  df <- a %>% filter(!is.na(.data[[v]])) %>% count(modalite = .data[[v]], QFT) %>%
-    group_by(modalite) %>% mutate(pct = 100 * n / sum(n), total = sum(n)) %>% ungroup()
-  g <- ggplot(df, aes(x = modalite, y = pct, fill = QFT)) +
-    geom_col(width = 0.7) +
-    geom_text(aes(label = sprintf("%.0f %%", pct)), position = position_stack(vjust = 0.5),
-              colour = "white", size = 3.2) +
-    geom_text(data = distinct(df, modalite, total), inherit.aes = FALSE,
-              aes(x = modalite, y = 103, label = paste0("n=", total)), size = 3) +
-    scale_fill_manual(values = couleurs_qft) +
-    labs(x = NULL, y = "% des participants", fill = NULL,
-         title = paste("Résultat du QFT selon :", libelles[v])) +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "top")
-  sauver(g, paste0("QFT_selon_", v, ".png"))
+landscape <- block_section(prop_section(page_size = page_size(orient = "landscape"), type = "nextPage"))
+portrait  <- block_section(prop_section(page_size = page_size(orient = "portrait"),  type = "nextPage"))
+doc <- read_docx() %>%
+  body_add_flextable(ft2) %>% body_end_block_section(portrait) %>%
+  body_add_flextable(ft3) %>% body_end_block_section(landscape) %>%
+  body_add_flextable(ft4) %>% body_add_par("") %>% body_add_flextable(ft5) %>%
+  body_add_par("") %>% body_add_flextable(ftS1) %>% body_end_block_section(portrait)
+print(doc, target = file.path(tab_dir, "Thesis_tables.docx"))
+
+openxlsx::write.xlsx(list("Table 2" = table2[, 1:2], "Table 3" = table3, "Table 4" = table4,
+                          "Table 5" = table5, "Table S1" = table_S1,
+                          "Prevalence by department" = prev_department,
+                          "Prevalence by occupation" = prev_occupation,
+                          "Adjusted OR (all methods)" = res_multi),
+                     file.path(tab_dir, "Thesis_tables.xlsx"))
+
+
+## 11. MISSING DATA ANALYSIS ===================================================
+# Describes how much data are missing, for which variables and participants,
+# and whether missingness is related to the QFT result or to other
+# characteristics (information supporting the missing-at-random assumption).
+all_vars <- c("age", "sex", "occupation_grp", "department_grp", "experience", "tb_exposure",
+              "agp", "specimen", "mask4", "biosafety_training", "bcg", "bcg_scar", "smoking",
+              "tb_history", "covid_history")
+
+# 11.1 Table S1 – missing values by variable, overall and by QFT result
+#      p-value: Fisher's exact test comparing the proportion of missing values
+#      between QFT-negative and QFT-positive participants.
+npct <- function(m, n) sprintf("%d (%s)", m, f1(100 * m / n))
+table_S1_full <- lapply(all_vars, function(v) {
+  miss <- is.na(a[[v]])
+  m_neg <- sum(miss[a$QFT == "QFT-"]); m_pos <- sum(miss[a$QFT == "QFT+"])
+  p <- if (sum(miss) > 0) fisher.test(table(miss, a$QFT))$p.value else NA
+  data.frame(Variable = unname(labels_en[v]),
+             `Missing, n (%)` = npct(sum(miss), n_tot),
+             `Missing in QFT− (n = 100), n (%)` = npct(m_neg, n_neg),
+             `Missing in QFT+ (n = 64), n (%)` = npct(m_pos, n_pos),
+             p = fp(p), n_missing = sum(miss), check.names = FALSE)
+}) %>% bind_rows() %>% arrange(desc(n_missing))
+names(table_S1_full)[3:4] <- c(sprintf("Missing in QFT− (n = %d), n (%%)", n_neg),
+                               sprintf("Missing in QFT+ (n = %d), n (%%)", n_pos))
+table_S1_full$p[table_S1_full$n_missing == 0] <- "—"
+table_S1_full <- table_S1_full %>% select(-n_missing)
+print(table_S1_full, row.names = FALSE)
+
+# 11.2 Number of missing values per participant
+miss_vars <- all_vars[sapply(a[all_vars], function(x) any(is.na(x)))]
+n_miss_person <- rowSums(is.na(a[miss_vars]))
+table_S2 <- as.data.frame(table(n_miss_person)) %>%
+  transmute(`Number of missing values` = as.character(n_miss_person), `Participants, n` = Freq,
+            `Participants, %` = f1(100 * Freq / n_tot))
+cat("\nParticipants with complete data on all variables:", sum(n_miss_person == 0),
+    sprintf("(%.1f%%)", 100 * mean(n_miss_person == 0)), "\n")
+cat("Total missing values:", sum(is.na(a[miss_vars])), "of", n_tot * length(all_vars),
+    sprintf("(%.1f%% of all cells)", 100 * sum(is.na(a[miss_vars])) / (n_tot * length(all_vars))), "\n")
+
+# 11.3 Table S3 – missing-data patterns (which variables are missing together)
+short_names <- c(bcg_scar = "BCG scar", biosafety_training = "Biosafety training", mask4 = "Mask use",
+                 experience = "Experience", bcg = "BCG vaccination", tb_exposure = "TB exposure",
+                 smoking = "Smoking", occupation_grp = "Occupation", department_grp = "Department")
+pattern <- apply(is.na(a[miss_vars]), 1, function(r) {
+  if (!any(r)) "None (complete data)" else paste(short_names[miss_vars[r]], collapse = ", ")
+})
+table_S3 <- data.frame(pattern, n_miss = n_miss_person) %>%
+  count(`Missing variables` = pattern, `Number missing` = n_miss, name = "Participants, n") %>%
+  arrange(desc(`Participants, n`)) %>%
+  mutate(`Participants, %` = f1(100 * `Participants, n` / n_tot))
+print(table_S3, row.names = FALSE)
+
+# 11.4 Table S4 – participants with complete vs incomplete data for the model
+#      variables (complete-case analysis vs excluded participants)
+a$complete_model <- factor(ifelse(complete.cases(a[model_vars]), "Complete", "Incomplete"),
+                           levels = c("Complete", "Incomplete"))
+cmp_cat <- function(var, label, level) {
+  tab <- table(a[[var]], a$complete_model); col <- colSums(tab)
+  p <- fisher.test(tab, simulate.p.value = nrow(tab) > 2, B = 1e5)$p.value
+  data.frame(Characteristic = label,
+             Complete = sprintf("%d (%s)", tab[level, "Complete"], f1(100 * tab[level, "Complete"] / col["Complete"])),
+             Incomplete = sprintf("%d (%s)", tab[level, "Incomplete"], f1(100 * tab[level, "Incomplete"] / col["Incomplete"])),
+             p = fp(p), Test = "Fisher")
 }
+cmp_num <- function(var, label) {
+  x <- a[[var]]; g <- a$complete_model
+  med <- function(z) sprintf("%s [%s–%s]", f1(median(z, na.rm = TRUE)),
+                             f1(quantile(z, .25, na.rm = TRUE)), f1(quantile(z, .75, na.rm = TRUE)))
+  data.frame(Characteristic = paste0(label, ", median [IQR]"), Complete = med(x[g == "Complete"]),
+             Incomplete = med(x[g == "Incomplete"]),
+             p = fp(wilcox.test(x ~ g, exact = FALSE)$p.value), Test = "Mann–Whitney")
+}
+set.seed(SEED)
+table_S4 <- rbind(
+  cmp_cat("QFT", "QFT positive", "QFT+"),
+  cmp_num("age", "Age (years)"),
+  cmp_cat("sex", "Female sex", "Female"),
+  cmp_cat("occupation_grp", "Nurse", "Nurse"),
+  cmp_cat("department_grp", "Intensive care department", "Intensive care"),
+  cmp_cat("agp", "Aerosol-generating procedures", "Yes")
+)
+names(table_S4)[2:3] <- c(sprintf("Complete data (n = %d)", sum(a$complete_model == "Complete")),
+                          sprintf("Incomplete data (n = %d)", sum(a$complete_model == "Incomplete")))
+print(table_S4, row.names = FALSE)
 
-## 10.8 Répartition du résultat QFT dans toute la population ---------------------
-df_qft <- d %>% mutate(resultat = case_when(qft == "QFT+" ~ "QFT+", qft == "QFT-" ~ "QFT-",
-                                            TRUE ~ "Indéterminé")) %>%
-  count(resultat) %>% mutate(pct = 100 * n / sum(n),
-                             resultat = factor(resultat, c("QFT-", "QFT+", "Indéterminé")))
-g_qft <- ggplot(df_qft, aes(x = resultat, y = n, fill = resultat)) +
-  geom_col(width = 0.6) +
-  geom_text(aes(label = sprintf("%d (%.1f %%)", n, pct)), vjust = -0.4) +
-  scale_fill_manual(values = c(couleurs_qft, "Indéterminé" = "grey70"), guide = "none") +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
-  labs(x = NULL, y = "Effectif", title = "Résultat du QuantiFERON (n = 165)")
-sauver(g_qft, "repartition_QFT.png", w = 5.5, h = 4.5)
+# 11.5 Supplementary figures: missing values by variable and by QFT result
+miss_plot_df <- lapply(miss_vars, function(v) a %>% group_by(QFT) %>%
+  summarise(pct = 100 * mean(is.na(.data[[v]])), .groups = "drop") %>% mutate(variable = labels_en[v])) %>%
+  bind_rows()
+order_miss <- miss_plot_df %>% group_by(variable) %>% summarise(m = mean(pct)) %>% arrange(m) %>% pull(variable)
+fig_miss <- miss_plot_df %>% mutate(variable = factor(variable, order_miss), QFT = factor(QFT, c("QFT+", "QFT-"))) %>%
+  ggplot(aes(pct, variable, fill = QFT)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = sprintf("%.1f%%", pct)), position = position_dodge(width = 0.8), hjust = -0.15, size = 3) +
+  scale_fill_manual(values = col_qft, breaks = c("QFT-", "QFT+")) +
+  scale_x_continuous(limits = c(0, 35), labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0))) +
+  labs(x = "Missing values (%)", y = NULL, fill = NULL,
+       title = "Missing values by variable and QuantiFERON result") +
+  th + theme(legend.position = "top", panel.grid.major.y = element_blank())
+save_fig(fig_miss, "S_missing_by_variable_and_QFT.png", 8, 5, supp_dir)
 
-## 10.9 Pyramide des âges par sexe ------------------------------------------------
-pyr <- a %>% mutate(classe = cut(age, c(15, 20, 25, 30, 35, 40, 45, 60), right = FALSE,
-                                 labels = c("15–19", "20–24", "25–29", "30–34", "35–39", "40–44", "≥ 45"))) %>%
-  count(classe, sexe) %>% mutate(n = ifelse(sexe == "Homme", -n, n))
-g_pyr <- ggplot(pyr, aes(x = classe, y = n, fill = sexe)) + geom_col(width = 0.8) +
-  coord_flip() + scale_y_continuous(labels = abs) +
-  scale_fill_manual(values = c(Femme = "#DD8452", Homme = "#55A868")) +
-  labs(x = "Âge (ans)", y = "Effectif", fill = NULL, title = "Pyramide des âges par sexe") +
-  theme(legend.position = "top")
-sauver(g_pyr, "pyramide_ages.png", w = 6, h = 4.5)
+fig_pattern <- table_S3 %>% filter(`Missing variables` != "None (complete data)") %>%
+  mutate(`Missing variables` = reorder(str_wrap(`Missing variables`, 45), `Participants, n`)) %>%
+  ggplot(aes(`Participants, n`, `Missing variables`)) + geom_col(fill = "#C44E52", width = 0.7) +
+  geom_text(aes(label = `Participants, n`), hjust = -0.3, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Participants", y = NULL, title = "Missing-data patterns",
+       subtitle = sprintf("%d participants (%.1f%%) had complete data on all variables",
+                          sum(n_miss_person == 0), 100 * mean(n_miss_person == 0))) + th
+save_fig(fig_pattern, "S_missing_data_patterns.png", 9, 7.5, supp_dir)
 
-## 10.10 Prévalence du QFT+ par profession avec IC à 95 % (Wilson) ---------------
-prev_prof <- a %>% filter(!is.na(profession_g)) %>% group_by(profession_g) %>%
-  summarise(n = n(), pos = sum(qft_pos), .groups = "drop") %>% rowwise() %>%
-  mutate(prev = pos / n,
-         bas  = suppressWarnings(prop.test(pos, n, correct = FALSE)$conf.int[1]),
-         haut = suppressWarnings(prop.test(pos, n, correct = FALSE)$conf.int[2])) %>% ungroup()
-g_prof <- ggplot(prev_prof, aes(x = reorder(profession_g, prev), y = 100 * prev)) +
-  geom_pointrange(aes(ymin = 100 * bas, ymax = 100 * haut)) +
-  geom_hline(yintercept = 100 * mean(a$qft_pos), linetype = 2) +
-  geom_text(aes(label = paste0(pos, "/", n)), nudge_x = 0.3, size = 3) +
-  coord_flip() + labs(x = NULL, y = "Prévalence QFT+ (%) et IC à 95 %",
-                      title = "Prévalence de l'ITL par profession",
-                      subtitle = "Ligne pointillée : prévalence globale")
-sauver(g_prof, "prevalence_profession.png")
-
-## 10.11 Carte des données manquantes ---------------------------------------------
-vars_manq <- c(vars_num, "sexe", "profession_g", "service_g", "exposition", "masque",
-               "formation", "bcg", "cicatrice", "tabac")
-carte <- a %>% mutate(ligne = row_number()) %>%
-  select(ligne, all_of(vars_manq)) %>%
-  mutate(across(-ligne, ~ is.na(.x))) %>%
-  pivot_longer(-ligne, names_to = "variable", values_to = "manquant") %>%
-  mutate(variable = factor(libelles[variable], levels = rev(libelles[vars_manq])))
-g_carte <- ggplot(carte, aes(x = ligne, y = variable, fill = manquant)) + geom_tile() +
-  scale_fill_manual(values = c(`FALSE` = "grey90", `TRUE` = "#C44E52"),
-                    labels = c("Renseigné", "Manquant")) +
-  labs(x = "Participant", y = NULL, fill = NULL, title = "Carte des données manquantes") +
-  theme(legend.position = "top", panel.grid = element_blank())
-sauver(g_carte, "carte_donnees_manquantes.png", w = 9, h = 4.5)
-
-g_manq <- manq %>% filter(n_manquant > 0) %>%
-  ggplot(aes(x = reorder(Variable, pourcentage), y = pourcentage)) +
-  geom_col(fill = "#C44E52") + geom_text(aes(label = paste0(pourcentage, " %")), hjust = -0.2, size = 3.2) +
-  coord_flip() + scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-  labs(x = NULL, y = "% de données manquantes", title = "Données manquantes par variable")
-sauver(g_manq, "pourcentage_manquants.png")
-
-## 10.12 Export Excel des tableaux descriptifs -----------------------------------
-openxlsx::write.xlsx(list("Quantitatives" = desc_quanti %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
-                          "Qualitatives"  = desc_quali),
-                     file.path(dossier, "tableaux_descriptifs.xlsx"))
-cat("\nAnalyse descriptive terminée :", length(list.files(dir_fig)), "figures dans", dir_fig, "\n")
+# 11.6 Export (Word and Excel)
+note_blank <- paste("Medical history, aerosol-generating procedures and specimen handling were free-text",
+                    "fields in which a blank answer was coded as \"none\"; they therefore have no missing values.")
+ftS1f <- ft_basic(table_S1_full, sprintf("Supplementary Table S1. Missing values by variable, overall and by QuantiFERON result (n = %d)", n_tot),
+  paste("p-value: Fisher's exact test comparing the proportion of missing values between QFT-negative and",
+        "QFT-positive participants.", note_blank), c(2.3, 1.1, 1.4, 1.4, 0.6))
+ftS2 <- ft_basic(table_S2, "Supplementary Table S2. Number of missing values per participant",
+  sprintf("Calculated over the %d variables with at least one missing value.", length(miss_vars)), c(2.0, 1.3, 1.3))
+ftS3 <- ft_basic(table_S3, "Supplementary Table S3. Missing-data patterns",
+  "Each row is a combination of variables missing together in the same participants.", c(3.6, 1.0, 1.0, 1.0)) %>%
+  align(j = 1, align = "left", part = "all")
+ftS4 <- ft_basic(table_S4, "Supplementary Table S4. Characteristics of participants with complete and incomplete data for the multivariable model",
+  paste("Complete data: no missing value among the six model variables (age, sex, TB exposure, aerosol-generating",
+        "procedures, mask use, BCG vaccination). Values are n (%) or median [IQR]. Fisher's exact test",
+        "(Monte Carlo p-value for variables with more than two categories) or Mann–Whitney U test.",
+        "For occupation and department, the p-value compares the whole distribution across all categories."),
+  c(2.4, 1.4, 1.4, 0.6, 1.0))
+doc_miss <- read_docx() %>% body_add_flextable(ftS1f) %>% body_add_par("") %>%
+  body_add_flextable(ftS2) %>% body_add_par("") %>% body_add_flextable(ftS3) %>% body_add_par("") %>%
+  body_add_flextable(ftS4) %>% body_add_par("") %>%
+  body_add_img(file.path(supp_dir, "S_missing_by_variable_and_QFT.png"), width = 6.3, height = 3.9) %>%
+  body_add_par("Supplementary Figure S1. Missing values by variable and QuantiFERON result.") %>%
+  body_add_img(file.path(supp_dir, "S_missing_data_patterns.png"), width = 6.3, height = 5.25) %>%
+  body_add_par("Supplementary Figure S2. Missing-data patterns.") %>%
+  body_add_img(file.path(supp_dir, "S_missing_data_map.png"), width = 6.3, height = 3.15) %>%
+  body_add_par("Supplementary Figure S3. Missing-data map (each column is a participant; red cells are missing values).")
+print(doc_miss, target = file.path(tab_dir, "Missing_data_tables.docx"))
+openxlsx::write.xlsx(list("S1 Missing by variable" = table_S1_full, "S2 Missing per participant" = table_S2,
+                          "S3 Missing patterns" = table_S3, "S4 Complete vs incomplete" = table_S4),
+                     file.path(tab_dir, "Missing_data_tables.xlsx"))
+cat("\nMissing-data analysis exported to", tab_dir, "\n")
 
 
+## 12. REPRODUCIBILITY ========================================================
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+cat("\nAnalysis complete. Tables in", tab_dir, "| figures in", fig_dir, "\n")
